@@ -47,7 +47,7 @@ import {
 } from 'fs'
 import { sep, join } from 'path'
 import { homedir } from 'os'
-import { execFileSync } from 'child_process'
+import { execFileSync, type ExecFileSyncOptions } from 'child_process'
 import {
   ACCESS_FILE,
   APPROVED_DIR,
@@ -86,7 +86,9 @@ const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
 const IDLE_EXIT_MS = Number(process.env.DISCORD_BROKER_IDLE_MS ?? 10 * 60 * 1000)
 
 function log(s: string): void {
-  process.stderr.write(`[broker] ${s}\n`)
+  // Timestamped because the log's job is to be read after the fact: without
+  // these there was no way to line a spawn up against the restart that killed it.
+  process.stderr.write(`[broker] ${new Date().toISOString()} ${s}\n`)
 }
 
 if (!TOKEN) {
@@ -586,6 +588,91 @@ const CLAUDE_BIN: string = (() => {
   return 'claude'
 })()
 
+/**
+ * Spawned sessions get a tmux server of their own, on its own socket.
+ *
+ * The default server is claude-cc.service's forking main process, and that unit
+ * is KillMode=control-group — so `systemctl stop|restart claude-cc`, which is
+ * what `restart-cc` and `update-discord --restart` run, reaped every session in
+ * the cgroup along with it. Only the systemd-managed session came back, which is
+ * why a second concurrent session never survived long enough to be useful.
+ */
+const SESSION_SOCKET = 'cc-sessions'
+
+/**
+ * systemd-run reaches the user manager over the session bus, which the broker
+ * does not inherit when it is started from inside a systemd-managed session.
+ */
+function userBusEnv(): NodeJS.ProcessEnv {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 1000
+  return {
+    ...process.env,
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR ?? `/run/user/${uid}`,
+    DBUS_SESSION_BUS_ADDRESS:
+      process.env.DBUS_SESSION_BUS_ADDRESS ?? `unix:path=/run/user/${uid}/bus`,
+  }
+}
+
+/** Whether the sessions server is up — `list-sessions` fails when it is not. */
+function sessionServerRunning(): boolean {
+  try {
+    execFileSync('tmux', ['-L', SESSION_SOCKET, 'list-sessions'], {
+      timeout: 5_000,
+      stdio: 'ignore',
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Run a tmux command that may have to start the sessions server. A process
+ * cannot fork its way out of a cgroup, so the invocation that starts the server
+ * goes through `systemd-run --user --scope` to land in one that does not belong
+ * to claude-cc.service. Sessions created later are spawned by the running server
+ * and inherit that cgroup for free.
+ */
+function startOnSessionServer(tmuxArgs: string[]): void {
+  const opts: ExecFileSyncOptions = { timeout: 20_000, stdio: ['ignore', 'ignore', 'pipe'] }
+  if (sessionServerRunning()) {
+    execFileSync('tmux', tmuxArgs, opts)
+    return
+  }
+  try {
+    execFileSync(
+      'systemd-run',
+      ['--user', '--scope', '--collect', '--quiet', '--', 'tmux', ...tmuxArgs],
+      { ...opts, env: userBusEnv() },
+    )
+  } catch (e) {
+    // A session that still dies with claude-cc beats no session at all, but say
+    // so plainly — this is the exact condition the separate server exists to avoid.
+    log(
+      `systemd-run unavailable (${String(e).slice(0, 200)}); ` +
+        `starting the sessions server in the broker's own cgroup, where a ` +
+        `claude-cc restart will kill it`,
+    )
+    execFileSync('tmux', tmuxArgs, opts)
+  }
+}
+
+/**
+ * Whether the session is really running. `tmux new-session -d` exits 0 as soon
+ * as the session exists, so a command that dies a moment later is independent
+ * of that exit code; the settle wait is what distinguishes the two.
+ */
+async function sessionAppears(name: string): Promise<boolean> {
+  let seen = false
+  for (let i = 0; i < 10 && !seen; i++) {
+    await new Promise(r => setTimeout(r, 200))
+    seen = tmuxSessions().includes(name)
+  }
+  if (!seen) return false
+  await new Promise(r => setTimeout(r, 1_500))
+  return tmuxSessions().includes(name)
+}
+
 /** Where /new starts sessions. One root for all of them, by design: edits
  *  routinely span repos, so a session is not scoped to one. */
 function spawnRoot(access: Access): string {
@@ -634,9 +721,18 @@ setInterval(() => {
     void (async () => {
       try {
         const ch = await fetchSendableChannel(channelId)
+        // Alive-but-silent and gone are different faults and want different
+        // next steps, so look before saying which one this is.
+        const spawnedName = loadAccess().spawned?.[channelId]?.name
+        const alive = spawnedName ? tmuxSessions().includes(tmuxNameFor(spawnedName)) : false
         await ch.send(
-          'That session never connected. `tmux ls` will show whether it started; ' +
-            '`~/.claude/channels/discord/broker.log` has the detail.',
+          alive
+            ? 'That session started but never registered with the broker. ' +
+                `\`tmux -L ${SESSION_SOCKET} attach\` to see what it is doing; ` +
+                '`~/.claude/channels/discord/broker.log` has the detail.'
+            : 'That session is gone — it exited before connecting. ' +
+                `\`tmux -L ${SESSION_SOCKET} ls\` shows what is left; ` +
+                '`~/.claude/channels/discord/broker.log` has the detail.',
         )
       } catch {}
     })()
@@ -680,32 +776,45 @@ async function spawnSession(
 
   const tmux = tmuxNameFor(name)
   const cwd = spawnRoot(access)
-  try {
-    // -e keeps the binding out of the command line, where it would show in ps.
-    execFileSync(
-      'tmux',
-      [
-        'new-session', '-d',
-        '-s', tmux,
-        '-c', cwd,
-        '-e', `DISCORD_BIND_CHANNEL=${channel.id}`,
-        CLAUDE_BIN, '--channels', 'plugin:discord@claude-plugins-official',
-      ],
-      { timeout: 15_000, stdio: ['ignore', 'ignore', 'pipe'] },
-    )
-  } catch (e) {
-    // Nothing was started, so leave no half-made channel or stale access entry
-    // behind for the operator to clean up by hand.
+
+  // A spawn that did not take should leave no half-made channel or stale access
+  // entry behind for the operator to clear up by hand.
+  const rollback = async (reason: string): Promise<void> => {
     const undo = loadAccess()
     delete undo.groups[channel.id]
     if (undo.spawned) delete undo.spawned[channel.id]
     saveAccess(undo)
-    await channel.delete('Claude Code session failed to start').catch(() => {})
+    await channel.delete(reason).catch(() => {})
+  }
+
+  try {
+    // -e keeps the binding out of the command line, where it would show in ps.
+    startOnSessionServer([
+      '-L', SESSION_SOCKET,
+      'new-session', '-d',
+      '-s', tmux,
+      '-c', cwd,
+      '-e', `DISCORD_BIND_CHANNEL=${channel.id}`,
+      CLAUDE_BIN, '--channels', 'plugin:discord@claude-plugins-official',
+    ])
+  } catch (e) {
+    await rollback('Claude Code session failed to start')
     throw e
   }
 
+  // Trusting tmux's exit code was how a dead spawn came to look like a live one:
+  // the channel stayed, nothing was listening in it, and the only sign was a
+  // timeout message 90 seconds later.
+  if (!(await sessionAppears(tmux))) {
+    await rollback('Claude Code session exited immediately')
+    log(`spawn died immediately: ${tmux} — channel ${channel.id} rolled back`)
+    throw new Error(
+      `the session started and exited immediately — nothing in \`tmux -L ${SESSION_SOCKET} ls\` for ${tmux}`,
+    )
+  }
+
   if (task.trim()) pendingTasks.set(channel.id, { task, userId, username, at: Date.now() })
-  log(`spawned session in #${name} (tmux ${tmux}, channel ${channel.id})`)
+  log(`spawned session in #${name} (tmux -L ${SESSION_SOCKET} ${tmux}, channel ${channel.id})`)
   return { channelId: channel.id, name, tmux }
 }
 
@@ -761,7 +870,7 @@ const PROTECTED_TMUX = 'cc'
 
 function tmuxSessions(): string[] {
   try {
-    return execFileSync('tmux', ['list-sessions', '-F', '#{session_name}'], {
+    return execFileSync('tmux', ['-L', SESSION_SOCKET, 'list-sessions', '-F', '#{session_name}'], {
       encoding: 'utf8',
       timeout: 5_000,
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -1383,7 +1492,7 @@ async function onCommand(interaction: import('discord.js').ChatInputCommandInter
       )
       await interaction.editReply(
         `Started **#${name}** — <#${channelId}>\n` +
-          `\`tmux attach -t ${tmux}\` to drive it from a terminal.` +
+          `\`tmux -L ${SESSION_SOCKET} attach -t ${tmux}\` to drive it from a terminal.` +
           (task ? '\nIts first task is queued and runs as soon as it connects.' : ''),
       )
     } catch (e) {
@@ -1421,7 +1530,10 @@ async function onCommand(interaction: import('discord.js').ChatInputCommandInter
       return
     }
     try {
-      execFileSync('tmux', ['kill-session', '-t', target], { timeout: 10_000, stdio: 'ignore' })
+      execFileSync('tmux', ['-L', SESSION_SOCKET, 'kill-session', '-t', target], {
+        timeout: 10_000,
+        stdio: 'ignore',
+      })
       await interaction.editReply(`Stopped \`${target}\`. Archiving its channel.`)
       if (s.channelId) await archiveChannel(s.channelId)
     } catch (e) {
