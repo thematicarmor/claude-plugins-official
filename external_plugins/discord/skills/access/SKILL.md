@@ -109,12 +109,18 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `set <key> <value>`
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
-`textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate types:
+`textChunkLimit`, `chunkMode`, `mentionPatterns`, `contextLimit`, `autoThread`.
+Validate types:
 - `ackReaction`: string (emoji) or `""` to disable
 - `replyToMode`: `off` | `first` | `all`
 - `textChunkLimit`: number
 - `chunkMode`: `length` | `newline`
 - `mentionPatterns`: JSON array of regex strings
+- `contextLimit`: number (context window for usage percentages)
+- `autoThread`: boolean (open a thread per session when several are connected)
+
+Changes to `contextLimit` and `autoThread` are read by the broker on the next
+message; no restart needed.
 
 Read, set the key, write, confirm.
 
