@@ -3,9 +3,15 @@
  * socket types so the routing rules can be exercised directly by tests.
  *
  * Routing rules, in order:
- *   1. A message in a session-owned thread goes to that session.
- *   2. Anywhere else it goes to the channel's focused session.
- *   3. Focus defaults to the most recently active session.
+ *   1. A message in a channel bound to a session goes to that session.
+ *   2. A message in a thread goes wherever its parent channel goes, so
+ *      replying inside a trace thread reaches the session it belongs to.
+ *   3. Anywhere else it goes to the channel's focused session.
+ *   4. Focus defaults to the most recently active session.
+ *
+ * Sessions spawned by `/new` get a channel of their own, which is what rule 1
+ * keys on. The control channel keeps rules 3 and 4, so its behaviour is
+ * unchanged from before spawning existed.
  */
 
 import type { SessionMeta, UsageSnapshot } from './protocol.ts'
@@ -13,7 +19,8 @@ import type { SessionMeta, UsageSnapshot } from './protocol.ts'
 export type Session = {
   meta: SessionMeta
   usage: UsageSnapshot | null
-  threadId: string | null
+  /** Channel this session owns outright, if it was spawned into one. */
+  channelId: string | null
   lastActive: number
 }
 
@@ -33,7 +40,7 @@ export function pct(u: UsageSnapshot | null): number | null {
 
 export class SessionRegistry {
   private sessions = new Map<string, Session>()
-  private threadOwner = new Map<string, string>()
+  private channelOwner = new Map<string, string>()
   private focus = new Map<string, string>()
 
   get size(): number {
@@ -42,19 +49,22 @@ export class SessionRegistry {
 
   /**
    * Register a session, or refresh one that reconnected. A reconnect carries
-   * over the thread and last usage — otherwise a broker restart would strand
-   * the session's existing thread and open a duplicate alongside it.
+   * over the channel binding and last usage — otherwise a broker restart would
+   * strand the session's channel and it would stop being routable.
+   *
+   * `meta.bindChannel` is honoured on registration: it is how a session
+   * spawned by `/new` claims the channel that was created for it.
    */
   add(meta: SessionMeta): Session {
     const existing = this.sessions.get(meta.sessionId)
     const s: Session = {
       meta,
       usage: existing?.usage ?? null,
-      threadId: existing?.threadId ?? null,
+      channelId: meta.bindChannel ?? existing?.channelId ?? null,
       lastActive: Date.now(),
     }
     this.sessions.set(meta.sessionId, s)
-    if (s.threadId) this.threadOwner.set(s.threadId, meta.sessionId)
+    if (s.channelId) this.channelOwner.set(s.channelId, meta.sessionId)
     return s
   }
 
@@ -71,7 +81,7 @@ export class SessionRegistry {
     const s = this.sessions.get(sessionId)
     if (!s) return null
     this.sessions.delete(sessionId)
-    if (s.threadId) this.threadOwner.delete(s.threadId)
+    if (s.channelId) this.channelOwner.delete(s.channelId)
     for (const [channel, id] of [...this.focus]) {
       if (id === sessionId) this.focus.delete(channel)
     }
@@ -88,21 +98,22 @@ export class SessionRegistry {
     if (s) s.usage = usage
   }
 
-  setThread(sessionId: string, threadId: string): void {
+  /** Give a session a channel of its own. */
+  bindChannel(sessionId: string, channelId: string): void {
     const s = this.sessions.get(sessionId)
     if (!s) return
-    if (s.threadId) this.threadOwner.delete(s.threadId)
-    s.threadId = threadId
-    this.threadOwner.set(threadId, sessionId)
+    if (s.channelId) this.channelOwner.delete(s.channelId)
+    s.channelId = channelId
+    this.channelOwner.set(channelId, sessionId)
   }
 
-  ownerOfThread(threadId: string): Session | null {
-    const id = this.threadOwner.get(threadId)
+  ownerOfChannel(channelId: string): Session | null {
+    const id = this.channelOwner.get(channelId)
     return id ? (this.sessions.get(id) ?? null) : null
   }
 
-  isSessionThread(threadId: string): boolean {
-    return this.threadOwner.has(threadId)
+  isBoundChannel(channelId: string): boolean {
+    return this.channelOwner.has(channelId)
   }
 
   /** Returns false if the session is unknown, so callers can report it. */
@@ -132,8 +143,17 @@ export class SessionRegistry {
     return this.all()[0] ?? null
   }
 
-  /** Thread first, then channel focus. */
-  routeForMessage(channelId: string): Session | null {
-    return this.ownerOfThread(channelId) ?? this.routeFor(channelId)
+  /**
+   * Bound channel first, then the parent of a thread, then channel focus.
+   * `parentId` is the thread's parent when the message arrived in a thread.
+   */
+  routeForMessage(channelId: string, parentId?: string | null): Session | null {
+    const direct = this.ownerOfChannel(channelId)
+    if (direct) return direct
+    if (parentId) {
+      const viaParent = this.ownerOfChannel(parentId)
+      if (viaParent) return viaParent
+    }
+    return this.routeFor(channelId)
   }
 }

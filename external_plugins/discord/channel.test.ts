@@ -72,14 +72,33 @@ test('focus on an unknown session is rejected', () => {
   expect(r.setFocus('chan', 'nope')).toBe(false)
 })
 
-test('a thread routes to its owner regardless of focus', () => {
+test('a bound channel routes to its owner regardless of focus', () => {
   const r = new SessionRegistry()
   r.add(meta('aaaaaaaa1', 'thematic'))
   r.add(meta('bbbbbbbb2', 'serv'))
-  r.setThread('bbbbbbbb2', 'thread1')
+  r.bindChannel('bbbbbbbb2', 'chan-serv')
   r.setFocus('chan', 'aaaaaaaa1')
-  expect(r.routeForMessage('thread1')?.meta.project).toBe('serv')
+  expect(r.routeForMessage('chan-serv')?.meta.project).toBe('serv')
   expect(r.routeForMessage('chan')?.meta.project).toBe('thematic')
+})
+
+test('a thread inside a bound channel reaches that channel\'s session', () => {
+  // Trace threads live inside a session's channel; replying in one should
+  // reach that session rather than falling through to whoever has focus.
+  const r = new SessionRegistry()
+  r.add(meta('aaaaaaaa1', 'thematic'))
+  r.add(meta('bbbbbbbb2', 'serv'))
+  r.bindChannel('bbbbbbbb2', 'chan-serv')
+  r.setFocus('thread-x', 'aaaaaaaa1')
+  expect(r.routeForMessage('thread-x', 'chan-serv')?.meta.project).toBe('serv')
+})
+
+test('bindChannel from meta claims the channel at registration', () => {
+  // How a session spawned by /new claims the channel created for it.
+  const r = new SessionRegistry()
+  r.add({ ...meta('cccccccc3', 'workspace'), bindChannel: 'chan-new' })
+  expect(r.routeForMessage('chan-new')?.meta.sessionId).toBe('cccccccc3')
+  expect(r.isBoundChannel('chan-new')).toBe(true)
 })
 
 test('losing the focused session falls back instead of going dead', () => {
@@ -91,14 +110,14 @@ test('losing the focused session falls back instead of going dead', () => {
   expect(r.routeForMessage('chan')?.meta.project).toBe('thematic')
 })
 
-test('removing a session releases its thread', () => {
+test('removing a session releases its channel', () => {
   const r = new SessionRegistry()
   r.add(meta('aaaaaaaa1', 'thematic'))
-  r.setThread('aaaaaaaa1', 'thread1')
-  expect(r.isSessionThread('thread1')).toBe(true)
+  r.bindChannel('aaaaaaaa1', 'chan-1')
+  expect(r.isBoundChannel('chan-1')).toBe(true)
   r.remove('aaaaaaaa1')
-  expect(r.isSessionThread('thread1')).toBe(false)
-  expect(r.routeForMessage('thread1')).toBeNull()
+  expect(r.isBoundChannel('chan-1')).toBe(false)
+  expect(r.routeForMessage('chan-1')).toBeNull()
 })
 
 test('an empty registry routes nowhere', () => {
@@ -158,9 +177,7 @@ test('multi-block turns are counted once, not once per record', () => {
   const { path } = transcriptFixture()
   // 3 records, one logical turn — the shape that inflated totals before.
   appendFileSync(path, turn('msg_1', { input_tokens: 2, cache_read_input_tokens: 100, cache_creation_input_tokens: 50, output_tokens: 10 }, 3))
-  const t = new UsageTracker('/irrelevant', 'test-session')
-  // @ts-expect-error — point the tracker straight at the fixture.
-  t.path = path
+  const t = new UsageTracker('/irrelevant', 'test-session', undefined, path)
   const snap = t.poll()!
   expect(snap.turns).toBe(1)
   expect(snap.outputTokens).toBe(10)
@@ -170,9 +187,7 @@ test('multi-block turns are counted once, not once per record', () => {
 test('usage accumulates across turns and tracks the latest context size', () => {
   const { path } = transcriptFixture()
   appendFileSync(path, turn('msg_1', { input_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 100, output_tokens: 10 }, 2))
-  const t = new UsageTracker('/irrelevant', 'test-session')
-  // @ts-expect-error — point the tracker straight at the fixture.
-  t.path = path
+  const t = new UsageTracker('/irrelevant', 'test-session', undefined, path)
   expect(t.poll()!.turns).toBe(1)
 
   appendFileSync(path, turn('msg_2', { input_tokens: 2, cache_read_input_tokens: 102, cache_creation_input_tokens: 40, output_tokens: 7 }, 1))
@@ -188,9 +203,7 @@ test('usage accumulates across turns and tracks the latest context size', () => 
 test('a record split across two polls is not lost or double-counted', () => {
   const { path } = transcriptFixture()
   const line = turn('msg_1', { input_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 100, output_tokens: 10 })
-  const t = new UsageTracker('/irrelevant', 'test-session')
-  // @ts-expect-error — point the tracker straight at the fixture.
-  t.path = path
+  const t = new UsageTracker('/irrelevant', 'test-session', undefined, path)
   // Writer is mid-line: no complete record yet.
   appendFileSync(path, line.slice(0, 30))
   expect(t.poll()).toBeNull()
@@ -215,9 +228,7 @@ test('an unset limit widens rather than reporting over 100%', () => {
 
 test('the tracker widens its own limit once a big prompt lands', () => {
   const { path } = transcriptFixture()
-  const t = new UsageTracker('/irrelevant', 'test-session')
-  // @ts-expect-error — point the tracker straight at the fixture.
-  t.path = path
+  const t = new UsageTracker('/irrelevant', 'test-session', undefined, path)
   appendFileSync(path, turn('m1', { input_tokens: 2, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 0, output_tokens: 5 }))
   expect(t.poll()!.contextLimit).toBe(1_000_000) // fixture model carries [1m]
 })
@@ -227,12 +238,12 @@ test('re-registering a session keeps it routable', () => {
   // registers again and must still receive messages.
   const r = new SessionRegistry()
   r.add(meta('aaaaaaaa1', 'thematic'))
-  r.setThread('aaaaaaaa1', 'thread1')
+  r.bindChannel('aaaaaaaa1', 'chan-1')
   r.add(meta('aaaaaaaa1', 'thematic'))
   expect(r.size).toBe(1)
   expect(r.routeForMessage('chan')?.meta.sessionId).toBe('aaaaaaaa1')
-  // The thread survives the reconnect instead of being orphaned.
-  expect(r.get('aaaaaaaa1')?.threadId).toBe('thread1')
+  // The channel survives the reconnect instead of being orphaned.
+  expect(r.get('aaaaaaaa1')?.channelId).toBe('chan-1')
   expect(r.routeForMessage('thread1')?.meta.sessionId).toBe('aaaaaaaa1')
 })
 

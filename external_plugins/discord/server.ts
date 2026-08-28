@@ -31,7 +31,9 @@ import {
   type BrokerMsg,
   type SessionMeta,
   type ShimMsg,
+  type UsageSnapshot,
 } from './protocol.ts'
+import { TraceExtractor, TranscriptTailer } from './transcript.ts'
 import { UsageTracker } from './usage.ts'
 
 function log(s: string): void {
@@ -60,6 +62,13 @@ function gitBranch(cwd: string): string | null {
   }
 }
 
+/**
+ * Set by the broker when it spawns a session via `/new`. Sessions spawned that
+ * way all share one cwd, so this is the only unambiguous link between the
+ * channel the broker created and the shim that registers a moment later.
+ */
+const BIND_CHANNEL = process.env.DISCORD_BIND_CHANNEL || undefined
+
 const META: SessionMeta = {
   sessionId: SESSION_ID,
   cwd: CWD,
@@ -67,6 +76,7 @@ const META: SessionMeta = {
   gitBranch: gitBranch(CWD),
   pid: process.pid,
   startedAt: Date.now(),
+  ...(BIND_CHANNEL ? { bindChannel: BIND_CHANNEL } : {}),
 }
 
 // ── broker connection ────────────────────────────────────────────────────────
@@ -165,7 +175,7 @@ function connect(): void {
     spawnAttempted = false
     s.write(encode({ t: 'hello', v: PROTOCOL_VERSION, version: PLUGIN_VERSION, meta: META }))
     log(`connected to broker (session ${SESSION_ID.slice(0, 8)})`)
-    pushUsage(true)
+    pushCurrentUsage()
   })
   s.on('data', read)
   s.on('error', () => {})
@@ -208,17 +218,48 @@ function callBroker(tool: string, args: Record<string, unknown>): Promise<string
   })
 }
 
-// ── usage reporting ──────────────────────────────────────────────────────────
+// ── usage and trace reporting ────────────────────────────────────────────────
 
+/**
+ * One tailer feeds both consumers: usage accounting and the trace of steps
+ * shown in the session's thread. Reading the transcript twice would work, but
+ * this keeps a single offset and one parse per poll.
+ */
+const tailer = new TranscriptTailer(CWD, SESSION_ID)
 const usage = new UsageTracker(CWD, SESSION_ID)
+const trace = new TraceExtractor()
 
-function pushUsage(force = false): void {
-  const snap = usage.poll()
-  if (!snap && !force) return
-  if (snap) toBroker({ t: 'usage', sessionId: SESSION_ID, usage: snap })
+let lastSnapshot: UsageSnapshot | null = null
+
+function pushTranscript(): void {
+  const recs = tailer.poll()
+  if (recs.length === 0) return
+
+  const snap = usage.consume(recs)
+  if (snap) {
+    lastSnapshot = snap
+    toBroker({ t: 'usage', sessionId: SESSION_ID, usage: snap })
+  }
+
+  const events = trace.consume(recs)
+  if (events.length > 0) toBroker({ t: 'trace', sessionId: SESSION_ID, events })
 }
 
-setInterval(() => pushUsage(), 10_000).unref()
+/**
+ * On reconnect the transcript usually has nothing new, so re-send what we
+ * already know — otherwise a restarted broker would show no usage for this
+ * session until its next turn.
+ */
+function pushCurrentUsage(): void {
+  pushTranscript()
+  if (lastSnapshot) toBroker({ t: 'usage', sessionId: SESSION_ID, usage: lastSnapshot })
+}
+
+/**
+ * Faster than the old 10s usage cadence because trace events are only useful
+ * while the step is still current. The mtime check makes an idle poll free.
+ */
+setInterval(pushTranscript, 2_000).unref()
 
 // ── MCP surface ──────────────────────────────────────────────────────────────
 

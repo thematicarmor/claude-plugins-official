@@ -89,9 +89,15 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 
 **`chunkMode`** chooses the split strategy: `length` cuts exactly at the limit; `newline` prefers paragraph boundaries.
 
-**`contextLimit`** pins the context window used for usage percentages. Leave it unset to infer from the model id — see the estimate caveat in [README.md](./README.md#session-usage-in-the-status-line).
+**`contextLimit`** pins the context window used for usage percentages. Leave it unset to infer from the model id — see the estimate caveat in [README.md](./README.md#session-usage-in-the-channel-topic).
 
-**`autoThread`** (default `true`) opens a Discord thread per session once a second session connects. `false` keeps everything in the channel root.
+**`trace`** (default `false`) mirrors each turn's tool calls and results into a thread off the message that started it. Everything written there is scrubbed for secrets first, but leave it off for work involving credentials the scrubber cannot recognise — see [Trace threads](./README.md#trace-threads).
+
+**`spawnRoot`** (default `~/workspace`) is the working directory `/new` starts sessions in. One root for all of them, deliberately: edits routinely span repos.
+
+**`sessionCategory`** / **`archiveCategory`** (default `claude-sessions` / `claude-archive`) name the categories `/new` creates channels under and `/kill` retires them to.
+
+**`spawned`** is written by the broker, not you: it records which channels `/new` created so they can be recognised and archived. Editing it by hand is not useful.
 
 ## Skill reference
 
@@ -105,7 +111,7 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 | `/discord:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
 | `/discord:access group add 846209781206941736` | Enable a guild channel. Flags: `--no-mention`, `--allow id1,id2`. |
 | `/discord:access group rm 846209781206941736` | Disable a guild channel. |
-| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`, `contextLimit`, `autoThread`. |
+| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`, `contextLimit`, `trace`, `spawnRoot`. |
 
 ## Config file
 
@@ -148,19 +154,31 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
   // model id, widening if a larger prompt is observed. Set it to be exact.
   "contextLimit": 1000000,
 
-  // Open a Discord thread per session once more than one is connected.
-  // false keeps everything in the channel, routed by focus alone.
-  "autoThread": true
+  // Mirror each turn's tool calls and results into a thread off the message
+  // that started it. Scrubbed for secrets, but off by default.
+  "trace": false,
+
+  // Working directory for sessions started with /new.
+  "spawnRoot": "/home/you/workspace"
 }
 ```
 
 ## Multiple sessions
 
-`requireMention` does not apply inside a session-owned thread — the thread is
-already dedicated to one session, so an `@mention` there would be pure
-friction. It still applies everywhere else in the channel.
+`requireMention` does not apply in a channel dedicated to one session, nor in
+a thread inside it — the channel is already an explicit address, so an
+`@mention` there would be pure friction. It still applies everywhere else.
 
-Slash commands (`/status`, `/sessions`, `/plan`, `/review`) are restricted to
-users in the top-level `allowFrom` or in the channel's `groups[].allowFrom`.
-Permission prompts remain restricted to top-level `allowFrom` only — group
-members can drive a session, but cannot approve tool permissions for it.
+Channels created by `/new` are registered automatically, with
+`requireMention: false` and the spawning operator in `allowFrom`.
+
+Slash commands (`/status`, `/sessions`, `/new`, `/kill`, `/plan`, `/review`)
+are restricted to users in the top-level `allowFrom` or in the channel's
+`groups[].allowFrom`. Permission prompts remain restricted to top-level
+`allowFrom` only — group members can drive a session, but cannot approve tool
+permissions for it.
+
+`/new` starts a process on the host from a chat message, and with a single
+working directory for every spawned session there is no per-project allowlist
+standing behind it. The operator check is the whole boundary; keep
+`allowFrom` tight.

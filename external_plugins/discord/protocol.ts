@@ -48,6 +48,15 @@ export type SessionMeta = {
   gitBranch: string | null
   pid: number
   startedAt: number
+  /**
+   * Channel this session was spawned to serve, from `DISCORD_BIND_CHANNEL`.
+   *
+   * Sessions spawned by `/new` all share one cwd (the workspace root), so cwd
+   * can no longer tell them apart. The broker sets this variable when it
+   * launches the process, which makes the link between "channel I just
+   * created" and "shim that just registered" exact rather than inferred.
+   */
+  bindChannel?: string
 }
 
 export type UsageSnapshot = {
@@ -63,11 +72,31 @@ export type UsageSnapshot = {
   updatedAt: number
 }
 
+/**
+ * A step worth showing in a session's trace thread.
+ *
+ * Note what is absent: the model's reasoning. Claude Code writes `thinking`
+ * blocks to the transcript with the text stripped — only an opaque signature
+ * survives — so a trace is a log of *actions taken*, not of reasoning. Tool
+ * calls and the assistant's own interstitial prose are the whole of what can
+ * be recovered.
+ */
+export type TraceEvent =
+  /** A new user turn began; opens a fresh thread. */
+  | { k: 'turn'; n: number; prompt: string; at: number }
+  /** A tool call, already summarised down to one line by the shim. */
+  | { k: 'tool'; name: string; summary: string; at: number }
+  /** What the tool returned, truncated — the useful half of reading a trace. */
+  | { k: 'result'; name: string; preview: string; lines: number; at: number }
+  /** Assistant prose between tool calls. */
+  | { k: 'text'; text: string; at: number }
+
 /** shim -> broker */
 export type ShimMsg =
   | { t: 'hello'; v: number; version: string; meta: SessionMeta }
   | { t: 'bye'; sessionId: string }
   | { t: 'usage'; sessionId: string; usage: UsageSnapshot }
+  | { t: 'trace'; sessionId: string; events: TraceEvent[] }
   | { t: 'call'; id: string; tool: string; args: Record<string, unknown> }
   | {
       t: 'permission_request'

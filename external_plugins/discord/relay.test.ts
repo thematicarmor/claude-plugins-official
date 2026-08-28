@@ -8,13 +8,19 @@
 
 import { expect, test, afterAll } from 'bun:test'
 import { createServer, type Server as NetServer, type Socket } from 'net'
-import { mkdtempSync } from 'fs'
+import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { makeLineReader, encode, type ShimMsg } from './protocol.ts'
 
 const dir = mkdtempSync(join(tmpdir(), 'disc-relay-'))
 const sock = join(dir, 'broker.sock')
+
+// A transcript the shim will find, so usage and trace reporting have a source.
+const projectsDir = join(dir, 'projects')
+const transcript = join(projectsDir, '-tmp-relay-project', 'relay-test-session.jsonl')
+mkdirSync(join(projectsDir, '-tmp-relay-project'), { recursive: true })
+writeFileSync(transcript, '')
 
 let brokerConn: Socket | null = null
 const fromShim: ShimMsg[] = []
@@ -55,6 +61,8 @@ const shim = Bun.spawn([process.execPath, join(import.meta.dir, 'server.ts')], {
     DISCORD_BROKER_SOCK: sock,
     CLAUDE_CODE_SESSION_ID: 'relay-test-session',
     CLAUDE_PROJECT_DIR: '/tmp/relay-project',
+    DISCORD_PROJECTS_DIR: projectsDir,
+    DISCORD_BIND_CHANNEL: 'chan-spawned-1',
     DISCORD_BOT_TOKEN: undefined,
   },
   stdin: 'pipe',
@@ -214,4 +222,42 @@ test('a permission request from Claude Code is relayed to the broker', async () 
   })
   const relayed = await waitFor(m => m.t === 'permission_request')
   expect(relayed).toMatchObject({ request_id: 'zyxwv', tool_name: 'Bash' })
+})
+
+test('a spawned session reports the channel it was bound to', async () => {
+  // How /new links "channel I created" to "shim that just registered". Every
+  // spawned session shares one cwd, so this is the only unambiguous signal.
+  const hello = await waitFor<Extract<ShimMsg, { t: 'hello' }>>(m => m.t === 'hello')
+  expect(hello.meta.bindChannel).toBe('chan-spawned-1')
+})
+
+test('steps written to the transcript are relayed as trace events', async () => {
+  // The shim tails its own transcript; the broker never reads the filesystem.
+  appendFileSync(
+    transcript,
+    JSON.stringify({ type: 'user', message: { content: 'check the broker' } }) +
+      '\n' +
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'msg_trace_1',
+          model: 'claude-opus-5',
+          content: [{ type: 'tool_use', id: 'toolu_x', name: 'Bash', input: { command: 'pgrep broker' } }],
+          usage: { input_tokens: 5, output_tokens: 2 },
+        },
+      }) +
+      '\n',
+  )
+  const trace = await waitFor<Extract<ShimMsg, { t: 'trace' }>>(m => m.t === 'trace')
+  expect(trace.sessionId).toBe('relay-test-session')
+  const kinds = trace.events.map(e => e.k)
+  expect(kinds).toContain('turn')
+  expect(kinds).toContain('tool')
+  const tool = trace.events.find(e => e.k === 'tool')
+  expect(tool).toMatchObject({ name: 'Bash', summary: 'Bash · pgrep broker' })
+})
+
+test('usage is reported from the same transcript read', async () => {
+  const usage = await waitFor<Extract<ShimMsg, { t: 'usage' }>>(m => m.t === 'usage')
+  expect(usage.usage.turns).toBeGreaterThan(0)
 })
