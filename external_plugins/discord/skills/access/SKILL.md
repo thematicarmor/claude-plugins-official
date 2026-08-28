@@ -109,12 +109,24 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `set <key> <value>`
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
-`textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate types:
+`textChunkLimit`, `chunkMode`, `mentionPatterns`, `contextLimit`, `trace`,
+`spawnRoot`.
+Validate types:
 - `ackReaction`: string (emoji) or `""` to disable
 - `replyToMode`: `off` | `first` | `all`
 - `textChunkLimit`: number
 - `chunkMode`: `length` | `newline`
 - `mentionPatterns`: JSON array of regex strings
+- `contextLimit`: number (context window for usage percentages)
+- `trace`: boolean (mirror each turn's tool calls and results into a thread)
+- `spawnRoot`: absolute path (working directory for sessions started by `/new`)
+
+Before enabling `trace`, say plainly that it posts tool arguments and tool
+output to Discord. It is scrubbed for known secrets and common credential
+shapes first, but that is a safety net, not a guarantee.
+
+Changes to these keys are read by the broker on the next message; no restart
+needed.
 
 Read, set the key, write, confirm.
 
