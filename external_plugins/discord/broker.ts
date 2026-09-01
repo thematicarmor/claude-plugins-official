@@ -2161,18 +2161,19 @@ const BROKER_UNIT = 'claude-broker.service'
  * unit that is the wrong instinct: every handover briefly frees the socket, the
  * shims pile into that gap, and the supervised broker spends its life taking
  * over from replacements it caused — 31 of them in one observed restart. An
- * unsupervised broker therefore stands down while the unit is active, and the
- * shim's next reconnect finds the supervised socket instead.
+ * unsupervised broker therefore stands down whenever the unit is *enabled*.
+ * Enablement is the stable signal: is-active reads "activating" for the whole
+ * of a restart, which is exactly the window the shims race into.
  */
 function supervisorOwnsThis(): boolean {
   if (SUPERVISED) return false
   try {
-    const out = execFileSync('systemctl', ['--user', 'is-active', BROKER_UNIT], {
+    const out = execFileSync('systemctl', ['--user', 'is-enabled', BROKER_UNIT], {
       timeout: 5_000,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     })
-    return out.trim() === 'active'
+    return out.trim() === 'enabled'
   } catch {
     // Not active, no systemd, or no user manager — carry on as before.
     return false
