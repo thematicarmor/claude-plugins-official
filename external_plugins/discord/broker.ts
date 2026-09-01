@@ -2151,8 +2151,13 @@ function onConnection(sock: Socket): void {
   })
 }
 
-/** systemd sets INVOCATION_ID for the processes it starts. */
-const SUPERVISED = Boolean(process.env.INVOCATION_ID)
+/**
+ * Set only by claude-broker.service. INVOCATION_ID looks like the obvious
+ * marker and is not one: systemd sets it for every process in a unit and
+ * children inherit it, so a broker the shim started inside claude-cc.service
+ * reported itself supervised, refused to stand down, and fought the real one.
+ */
+const SUPERVISED = process.env.CLAUDE_BROKER_SUPERVISED === '1'
 const PID_PATH = join(STATE_DIR, 'broker.pid')
 const BROKER_UNIT = 'claude-broker.service'
 
