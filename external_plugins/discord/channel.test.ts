@@ -258,3 +258,48 @@ test('usage from an unknown session is ignored rather than throwing', () => {
   expect(() => r.touch('ghost')).not.toThrow()
   expect(r.remove('ghost')).toBeNull()
 })
+
+// ── idle suspension ──────────────────────────────────────────────────────────
+
+test('a session quiet on both clocks is idle', () => {
+  const r = new SessionRegistry()
+  const s = r.add(meta('aaaaaaaa1', 'thematic'))
+  s.lastActive = Date.now() - 3 * 60 * 60 * 1000
+  s.lastProgress = Date.now() - 3 * 60 * 60 * 1000
+  expect(r.idleFor(2 * 60 * 60 * 1000).map(x => x.meta.sessionId)).toEqual([s.meta.sessionId])
+})
+
+test('a session working alone is not idle, however long since anyone spoke to it', () => {
+  const r = new SessionRegistry()
+  const s = r.add(meta('aaaaaaaa1', 'thematic'))
+  // Nobody has typed at it for three hours, but it is still producing output.
+  s.lastActive = Date.now() - 3 * 60 * 60 * 1000
+  s.lastProgress = Date.now()
+  expect(r.idleFor(2 * 60 * 60 * 1000)).toEqual([])
+})
+
+test('a session spoken to recently is not idle even if it has produced nothing', () => {
+  const r = new SessionRegistry()
+  const s = r.add(meta('aaaaaaaa1', 'thematic'))
+  s.lastActive = Date.now()
+  s.lastProgress = Date.now() - 3 * 60 * 60 * 1000
+  expect(r.idleFor(2 * 60 * 60 * 1000)).toEqual([])
+})
+
+test('progress() refreshes the working clock without touching the spoken-to one', () => {
+  const r = new SessionRegistry()
+  const s = r.add(meta('aaaaaaaa1', 'thematic'))
+  s.lastActive = 1000
+  s.lastProgress = 1000
+  r.progress('aaaaaaaa1')
+  expect(s.lastProgress).toBeGreaterThan(1000)
+  expect(s.lastActive).toBe(1000)
+})
+
+test('a reconnecting session keeps its working clock', () => {
+  const r = new SessionRegistry()
+  const s = r.add(meta('aaaaaaaa1', 'thematic'))
+  s.lastProgress = 4242
+  const again = r.add(meta('aaaaaaaa1', 'thematic'))
+  expect(again.lastProgress).toBe(4242)
+})

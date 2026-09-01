@@ -135,7 +135,26 @@ type Access = {
   sessionCategory?: string
   archiveCategory?: string
   /** Channels created by /new, so they can be cleaned up and recognised. */
-  spawned?: Record<string, { name: string; createdAt: number; createdBy: string }>
+  spawned?: Record<
+    string,
+    {
+      name: string
+      createdAt: number
+      createdBy: string
+      /**
+       * Set when the session was suspended for idleness. Holds the Claude
+       * session id so the next message in the channel can resume it with
+       * `--resume` rather than starting a blank one.
+       */
+      suspendedSession?: string
+      suspendedAt?: number
+    }
+  >
+  /**
+   * Idle time before a spawned session is suspended. Both the "spoken to" and
+   * "producing output" clocks must be quiet this long. 0 disables suspension.
+   */
+  sessionIdleMs?: number
 }
 
 function defaultAccess(): Access {
@@ -789,14 +808,7 @@ async function spawnSession(
 
   try {
     // -e keeps the binding out of the command line, where it would show in ps.
-    startOnSessionServer([
-      '-L', SESSION_SOCKET,
-      'new-session', '-d',
-      '-s', tmux,
-      '-c', cwd,
-      '-e', `DISCORD_BIND_CHANNEL=${channel.id}`,
-      CLAUDE_BIN, '--channels', 'plugin:discord@claude-plugins-official',
-    ])
+    startOnSessionServer(sessionTmuxArgs(tmux, cwd, channel.id))
   } catch (e) {
     await rollback('Claude Code session failed to start')
     throw e
@@ -899,6 +911,9 @@ const ARCHIVE_GRACE_MS = 60_000
 
 function scheduleArchive(channelId: string): void {
   if (pendingArchives.has(channelId)) return
+  // A suspension also closes the socket, but that channel is still live —
+  // archiving it would retire a session the user is about to come back to.
+  if (loadAccess().spawned?.[channelId]?.suspendedSession) return
   const timer = setTimeout(() => {
     pendingArchives.delete(channelId)
     // Still gone after the grace period — now it has really ended.
@@ -932,6 +947,195 @@ async function archiveChannel(channelId: string): Promise<void> {
     log(`archive of ${channelId} failed: ${e}`)
   }
 }
+
+/**
+ * Per-session memory bounds. The tmux *server* already runs in a systemd scope,
+ * but every session started afterwards inherits that one cgroup — so a limit
+ * set there would cap the whole pool rather than one session. Wrapping the
+ * claude process itself gives each session a scope of its own, which is what
+ * makes a runaway die alone instead of the kernel shooting whichever session
+ * happens to be largest.
+ */
+const SESSION_MEMORY_HIGH = process.env.DISCORD_SESSION_MEMORY_HIGH ?? '1200M'
+const SESSION_MEMORY_MAX = process.env.DISCORD_SESSION_MEMORY_MAX ?? '1600M'
+
+/** tmux argv for a session, optionally resuming an existing Claude session. */
+function sessionTmuxArgs(
+  tmux: string,
+  cwd: string,
+  channelId: string,
+  resumeId?: string,
+): string[] {
+  return [
+    '-L', SESSION_SOCKET,
+    'new-session', '-d',
+    '-s', tmux,
+    '-c', cwd,
+    // -e keeps the binding out of the command line, where it would show in ps.
+    '-e', `DISCORD_BIND_CHANNEL=${channelId}`,
+    'systemd-run', '--user', '--scope', '--collect', '--quiet',
+    `--property=MemoryHigh=${SESSION_MEMORY_HIGH}`,
+    `--property=MemoryMax=${SESSION_MEMORY_MAX}`,
+    '--',
+    CLAUDE_BIN,
+    '--channels', 'plugin:discord@claude-plugins-official',
+    ...(resumeId ? ['--resume', resumeId] : []),
+  ]
+}
+
+// ── idle suspension ──────────────────────────────────────────────────────────
+
+/**
+ * Sessions are suspended rather than ended. Killing the process reclaims the
+ * ~400MB it holds, but the transcript outlives it, so the next message in the
+ * channel resumes the same conversation with `--resume`. That distinction is
+ * what makes a short timeout safe: this user habitually returns to a session
+ * the next morning, and a reaper that destroyed context would throw away the
+ * longest-running work on the machine.
+ */
+const DEFAULT_SESSION_IDLE_MS = 2 * 60 * 60 * 1000
+const IDLE_SWEEP_MS = 5 * 60 * 1000
+
+function sessionIdleMs(access: Access): number {
+  return access.sessionIdleMs ?? DEFAULT_SESSION_IDLE_MS
+}
+
+async function suspendSession(s: Session): Promise<void> {
+  const channelId = s.channelId
+  if (!channelId) return
+  const access = loadAccess()
+  const entry = access.spawned?.[channelId]
+  if (!entry) return // not ours to suspend
+
+  const tmux = tmuxNameFor(entry.name)
+  if (tmux === PROTECTED_TMUX) return
+  try {
+    execFileSync('tmux', ['-L', SESSION_SOCKET, 'kill-session', '-t', tmux], {
+      timeout: 10_000,
+      stdio: 'ignore',
+    })
+  } catch (e) {
+    log(`suspend of ${tmux} failed: ${String(e).slice(0, 200)}`)
+    return
+  }
+
+  // Recorded before the socket close lands, so the archive path can tell a
+  // suspension from a session that really ended.
+  const a = loadAccess()
+  if (a.spawned?.[channelId]) {
+    a.spawned[channelId].suspendedSession = s.meta.sessionId
+    a.spawned[channelId].suspendedAt = Date.now()
+    saveAccess(a)
+  }
+  log(`suspended ${shortId(s.meta.sessionId)} (${tmux}) after idle`)
+
+  try {
+    const ch = await client.channels.fetch(channelId)
+    if (ch && ch.type === ChannelType.GuildText) {
+      const hours = Math.round(sessionIdleMs(loadAccess()) / 3_600_000)
+      await (ch as TextChannel).send(
+        `Suspended after ${hours}h idle to free memory — its context is kept. ` +
+          `Send a message here and it picks up where it left off.`,
+      )
+    }
+  } catch {}
+}
+
+function sweepIdleSessions(): void {
+  const access = loadAccess()
+  const idleMs = sessionIdleMs(access)
+  if (idleMs <= 0) return
+  for (const s of registry.idleFor(idleMs)) {
+    // Only spawned sessions are suspendable; the systemd one and any
+    // hand-started session are left alone.
+    if (!s.channelId || !access.spawned?.[s.channelId]) continue
+    void suspendSession(s)
+  }
+}
+
+/**
+ * Bring back a session suspended from this channel. Returns false when there is
+ * nothing to resume, so the caller can fall through to its usual handling.
+ */
+/**
+ * Channels whose session died without a clean exit — an OOM kill, a reboot —
+ * stay bound to a session that no longer exists, and nothing ever noticed
+ * because archival only ran on a deliberate stop. Reconciling at startup is
+ * what stops `spawned` growing without bound.
+ */
+async function reconcileSpawned(): Promise<void> {
+  const access = loadAccess()
+  const spawned = access.spawned ?? {}
+  const live = new Set(tmuxSessions())
+  let archived = 0
+  for (const [channelId, entry] of Object.entries(spawned)) {
+    if (entry.suspendedSession) continue // intentionally parked
+    if (live.has(tmuxNameFor(entry.name))) continue
+    if (registry.isBoundChannel(channelId)) continue
+    await archiveChannel(channelId)
+    archived++
+  }
+  if (archived > 0) log(`reconciled ${archived} channel(s) whose session was gone`)
+}
+
+async function resumeSuspended(channelId: string): Promise<boolean> {
+  const access = loadAccess()
+  const entry = access.spawned?.[channelId]
+  if (!entry?.suspendedSession) return false
+
+  const tmux = tmuxNameFor(entry.name)
+  if (tmuxSessions().includes(tmux)) return false // already running
+
+  const cwd = spawnRoot(access)
+  try {
+    startOnSessionServer(sessionTmuxArgs(tmux, cwd, channelId, entry.suspendedSession))
+  } catch (e) {
+    log(`resume of ${tmux} failed: ${String(e).slice(0, 200)}`)
+    return false
+  }
+  if (!(await sessionAppears(tmux))) {
+    log(`resume died immediately: ${tmux}`)
+    return false
+  }
+
+  const a = loadAccess()
+  if (a.spawned?.[channelId]) {
+    delete a.spawned[channelId].suspendedSession
+    delete a.spawned[channelId].suspendedAt
+    saveAccess(a)
+  }
+  cancelArchive(channelId)
+  log(`resumed ${shortId(entry.suspendedSession)} into ${tmux}`)
+  return true
+}
+
+
+/**
+ * Discord's typing indicator lapses after about ten seconds, and a turn here
+ * runs a median of two and a half minutes — so the single sendTyping() this
+ * replaces left every observed turn looking dead long before the answer
+ * arrived. Re-firing on an interval is the cheapest honest "still working".
+ */
+const TYPING_INTERVAL_MS = 8_000
+const typingTimers = new Map<string, ReturnType<typeof setInterval>>()
+
+function startTyping(sessionId: string, channel: unknown): void {
+  stopTyping(sessionId)
+  if (!channel || typeof channel !== 'object' || !('sendTyping' in channel)) return
+  const send = () => void (channel as TextChannel).sendTyping().catch(() => {})
+  send()
+  const timer = setInterval(send, TYPING_INTERVAL_MS)
+  timer.unref?.()
+  typingTimers.set(sessionId, timer)
+}
+
+function stopTyping(sessionId: string): void {
+  const timer = typingTimers.get(sessionId)
+  if (!timer) return
+  clearInterval(timer)
+  typingTimers.delete(sessionId)
+}
+
 
 // ── trace threads ────────────────────────────────────────────────────────────
 
@@ -1575,8 +1779,11 @@ async function onCommand(interaction: import('discord.js').ChatInputCommandInter
       target,
       'review',
       `Run the code-review skill at ${effort} effort on ${tgt ? `\`${tgt}\`` : 'the current diff'}. ` +
-        'Post the findings to Discord with the reply tool, most severe first, each with file:line ' +
-        'and a one-line failure scenario. Do not apply fixes unless asked.',
+        'The findings belong on the pull request, not only in chat: if the branch under ' +
+        'review has no open PR, push it and open one (draft is fine) first, then pass ' +
+        '--comment so the findings land as inline PR comments. ' +
+        'Then reply in Discord with the PR link and a one-line summary per finding, most ' +
+        'severe first, each with file:line. Do not apply fixes unless asked.',
       interaction.channelId,
       interaction.user.id,
       interaction.user.username,
@@ -1718,6 +1925,21 @@ async function handleInbound(msg: Message): Promise<void> {
   const target = registry.routeForMessage(chat_id, parentId)
 
   if (!target) {
+    // The channel may own a suspended session; bring it back and let the user
+    // resend rather than reporting nothing is connected.
+    if (await resumeSuspended(parentId ?? chat_id)) {
+      await msg
+        .reply('Resuming that session — it will pick up your message shortly.')
+        .then(m => noteSent(m.id))
+        .catch(() => {})
+      pendingTasks.set(parentId ?? chat_id, {
+        task: msg.content,
+        userId: msg.author.id,
+        username: msg.author.username,
+        at: Date.now(),
+      })
+      return
+    }
     await msg
       .reply('No Claude Code session is connected right now.')
       .then(m => noteSent(m.id))
@@ -1726,7 +1948,7 @@ async function handleInbound(msg: Message): Promise<void> {
   }
   registry.touch(target.meta.sessionId)
 
-  if ('sendTyping' in msg.channel) void msg.channel.sendTyping().catch(() => {})
+  startTyping(target.meta.sessionId, msg.channel)
 
   const access = result.access
   if (access.ackReaction) void msg.react(access.ackReaction).catch(() => {})
@@ -1817,6 +2039,9 @@ function onConnection(sock: Socket): void {
       }
       case 'usage': {
         registry.setUsage(msg.sessionId, msg.usage)
+        // Transcript growth is the only signal that distinguishes a session
+        // working alone from one that has been abandoned.
+        registry.progress(msg.sessionId)
         scheduleTopicUpdate(true)
         break
       }
@@ -1832,7 +2057,10 @@ function onConnection(sock: Socket): void {
             reply = { t: 'result', id: msg.id, ok: true, text: await runTool(msg.tool, msg.args) }
             // The answer has been posted, so this turn's trace is complete.
             // A later step reopens a thread; that is the intended rhythm.
-            if (msg.tool === 'reply' && sessionId) await closeTraceThread(sessionId)
+            if (msg.tool === 'reply' && sessionId) {
+              stopTyping(sessionId)
+              await closeTraceThread(sessionId)
+            }
           } catch (e) {
             reply = {
               t: 'result',
@@ -1876,6 +2104,7 @@ function onConnection(sock: Socket): void {
     if (socks.get(sessionId) !== sock) return
     socks.delete(sessionId)
     const gone = registry.remove(sessionId)
+    stopTyping(sessionId)
     void closeTraceThread(sessionId)
     lastInboundMessage.delete(sessionId)
     lastTurn.delete(sessionId)
@@ -1946,6 +2175,8 @@ client.once('ready', c => {
   log(`gateway connected as ${c.user.tag}`)
   void registerCommands()
   scheduleTopicUpdate(true)
+  void reconcileSpawned()
+  setInterval(sweepIdleSessions, IDLE_SWEEP_MS).unref()
 })
 
 function login(): void {
