@@ -2154,6 +2154,30 @@ function onConnection(sock: Socket): void {
 /** systemd sets INVOCATION_ID for the processes it starts. */
 const SUPERVISED = Boolean(process.env.INVOCATION_ID)
 const PID_PATH = join(STATE_DIR, 'broker.pid')
+const BROKER_UNIT = 'claude-broker.service'
+
+/**
+ * A shim starts a broker whenever it finds no socket. Once the job belongs to a
+ * unit that is the wrong instinct: every handover briefly frees the socket, the
+ * shims pile into that gap, and the supervised broker spends its life taking
+ * over from replacements it caused — 31 of them in one observed restart. An
+ * unsupervised broker therefore stands down while the unit is active, and the
+ * shim's next reconnect finds the supervised socket instead.
+ */
+function supervisorOwnsThis(): boolean {
+  if (SUPERVISED) return false
+  try {
+    const out = execFileSync('systemctl', ['--user', 'is-active', BROKER_UNIT], {
+      timeout: 5_000,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    return out.trim() === 'active'
+  } catch {
+    // Not active, no systemd, or no user manager — carry on as before.
+    return false
+  }
+}
 
 /**
  * Ask the incumbent broker to stand down. It handles SIGTERM by releasing the
@@ -2179,6 +2203,10 @@ function takeOverFrom(): boolean {
 }
 
 function startSocket(): void {
+  if (supervisorOwnsThis()) {
+    log(`${BROKER_UNIT} is running — leaving the socket to it`)
+    process.exit(0)
+  }
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
   const server = createServer(onConnection)
   server.on('error', (err: NodeJS.ErrnoException) => {
