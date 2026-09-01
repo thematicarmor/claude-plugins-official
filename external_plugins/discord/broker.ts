@@ -2168,10 +2168,15 @@ const BROKER_UNIT = 'claude-broker.service'
 function supervisorOwnsThis(): boolean {
   if (SUPERVISED) return false
   try {
+    // A shim-spawned broker inherits Claude Code's environment, which carries
+    // neither XDG_RUNTIME_DIR nor the bus address — without them systemctl
+    // fails with "Failed to connect to bus", the check reads false, and the
+    // contender it was meant to remove starts anyway.
     const out = execFileSync('systemctl', ['--user', 'is-enabled', BROKER_UNIT], {
       timeout: 5_000,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      env: userBusEnv(),
     })
     return out.trim() === 'enabled'
   } catch {
