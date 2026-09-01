@@ -2021,6 +2021,10 @@ let idleTimer: ReturnType<typeof setTimeout> | null = null
 
 function armIdleExit(): void {
   if (idleTimer) clearTimeout(idleTimer)
+  // Under a supervisor the exit is pointless churn: systemd restarts the broker
+  // immediately, and in the gap the bot is simply absent from Discord. 0 keeps
+  // it resident.
+  if (IDLE_EXIT_MS <= 0) return
   if (registry.size > 0) return
   idleTimer = setTimeout(() => {
     if (registry.size === 0) {
