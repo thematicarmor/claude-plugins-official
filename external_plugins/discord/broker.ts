@@ -931,21 +931,48 @@ function cancelArchive(channelId: string): void {
   pendingArchives.delete(channelId)
 }
 
+/**
+ * Retire a spawned channel and forget it. Forgetting is the point: `spawned`
+ * and `groups` were only ever appended to, so they had grown to 27 and 28
+ * entries against ten live sessions. A channel deleted in Discord drops its
+ * access grant too; one that still exists keeps it, so the transcript stays
+ * readable after the session behind it has gone.
+ */
 async function archiveChannel(channelId: string): Promise<void> {
   const access = loadAccess()
   if (!access.spawned?.[channelId]) return
+  let deleted = false
   try {
     const ch = await client.channels.fetch(channelId)
     if (!ch || ch.type !== ChannelType.GuildText) return
     const text = ch as TextChannel
-    if (text.name.startsWith('✓')) return
-    const category = await findOrCreateCategory(text.guild, access.archiveCategory ?? 'claude-archive')
-    await text.setParent(category.id, { lockPermissions: false })
-    await text.setName(`✓-${text.name}`.slice(0, 100))
-    await text.send('Session ended.')
+    if (!text.name.startsWith('✓')) {
+      const category = await findOrCreateCategory(
+        text.guild,
+        access.archiveCategory ?? 'claude-archive',
+      )
+      await text.setParent(category.id, { lockPermissions: false })
+      await text.setName(`✓-${text.name}`.slice(0, 100))
+      await text.send('Session ended.')
+    }
   } catch (e) {
-    log(`archive of ${channelId} failed: ${e}`)
+    // 10003 is Unknown Channel: it was deleted in Discord, so there is nothing
+    // to archive and no reason to keep granting access to it.
+    deleted = typeof e === 'object' && e !== null && (e as { code?: number }).code === 10003
+    if (!deleted) {
+      log(`archive of ${channelId} failed: ${e}`)
+      return // leave the entry so a later reconcile can retry
+    }
   }
+  forgetSpawned(channelId, deleted)
+}
+
+/** Drop a retired channel's bookkeeping. */
+function forgetSpawned(channelId: string, alsoRevokeAccess: boolean): void {
+  const a = loadAccess()
+  if (a.spawned) delete a.spawned[channelId]
+  if (alsoRevokeAccess) delete a.groups[channelId]
+  saveAccess(a)
 }
 
 /**
@@ -1075,7 +1102,10 @@ async function reconcileSpawned(): Promise<void> {
     await archiveChannel(channelId)
     archived++
   }
-  if (archived > 0) log(`reconciled ${archived} channel(s) whose session was gone`)
+  if (archived > 0) {
+    const left = Object.keys(loadAccess().spawned ?? {}).length
+    log(`reconciled ${archived} channel(s) whose session was gone; ${left} tracked`)
+  }
 }
 
 async function resumeSuspended(channelId: string): Promise<boolean> {
