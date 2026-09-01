@@ -2151,6 +2151,33 @@ function onConnection(sock: Socket): void {
   })
 }
 
+/** systemd sets INVOCATION_ID for the processes it starts. */
+const SUPERVISED = Boolean(process.env.INVOCATION_ID)
+const PID_PATH = join(STATE_DIR, 'broker.pid')
+
+/**
+ * Ask the incumbent broker to stand down. It handles SIGTERM by releasing the
+ * socket, so the caller only has to wait before rebinding. Returns false when
+ * there is nothing to signal, in which case the caller should step aside as
+ * before rather than spin.
+ */
+function takeOverFrom(): boolean {
+  let pid = 0
+  try {
+    pid = Number(readFileSync(PID_PATH, 'utf8').trim())
+  } catch {
+    return false
+  }
+  if (!pid || pid === process.pid) return false
+  try {
+    process.kill(pid, 'SIGTERM')
+  } catch {
+    return false // already gone; the socket file is stale and will be reclaimed
+  }
+  log(`taking over from unsupervised broker (pid ${pid})`)
+  return true
+}
+
 function startSocket(): void {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
   const server = createServer(onConnection)
@@ -2168,6 +2195,15 @@ function startSocket(): void {
       })
       probe.on('connect', () => {
         probe.destroy()
+        // A shim bootstraps a broker whenever it finds no socket, which races
+        // the supervised one on startup. Yielding here left systemd restarting
+        // every five seconds and exiting each time, while the unsupervised
+        // broker it deferred to stayed unsupervised. The managed instance takes
+        // over instead; an unmanaged one still steps aside.
+        if (SUPERVISED && takeOverFrom()) {
+          setTimeout(() => server.listen(SOCKET_PATH), 500)
+          return
+        }
         log('another broker is already listening — exiting')
         process.exit(0)
       })
@@ -2180,6 +2216,9 @@ function startSocket(): void {
   server.listen(SOCKET_PATH, () => {
     try {
       chmodSync(SOCKET_PATH, 0o600)
+    } catch {}
+    try {
+      writeFileSync(PID_PATH, String(process.pid), { mode: 0o600 })
     } catch {}
     log(`listening on ${SOCKET_PATH}`)
     armIdleExit()
@@ -2196,6 +2235,13 @@ function shutdown(): void {
   log('shutting down')
   try {
     rmSync(SOCKET_PATH, { force: true })
+  } catch {}
+  // Only clear the pidfile if it is still ours: a broker taking over has
+  // already written its own, and removing that would strand the next takeover.
+  try {
+    if (readFileSync(PID_PATH, 'utf8').trim() === String(process.pid)) {
+      rmSync(PID_PATH, { force: true })
+    }
   } catch {}
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(client.destroy()).finally(() => process.exit(0))
