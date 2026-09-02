@@ -135,7 +135,26 @@ type Access = {
   sessionCategory?: string
   archiveCategory?: string
   /** Channels created by /new, so they can be cleaned up and recognised. */
-  spawned?: Record<string, { name: string; createdAt: number; createdBy: string }>
+  spawned?: Record<
+    string,
+    {
+      name: string
+      createdAt: number
+      createdBy: string
+      /**
+       * Set when the session was suspended for idleness. Holds the Claude
+       * session id so the next message in the channel can resume it with
+       * `--resume` rather than starting a blank one.
+       */
+      suspendedSession?: string
+      suspendedAt?: number
+    }
+  >
+  /**
+   * Idle time before a spawned session is suspended. Both the "spoken to" and
+   * "producing output" clocks must be quiet this long. 0 disables suspension.
+   */
+  sessionIdleMs?: number
 }
 
 function defaultAccess(): Access {
@@ -570,21 +589,52 @@ async function runTool(tool: string, args: Record<string, unknown>): Promise<str
 
 const WORKSPACE_ROOT = join(homedir(), 'workspace')
 
+/** Directories a `claude` install lands in, newest node version first. */
+function claudeBinDirs(): string[] {
+  const nvm = join(homedir(), '.nvm', 'versions', 'node')
+  let nvmBins: string[] = []
+  try {
+    nvmBins = readdirSync(nvm)
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+      .map(v => join(nvm, v, 'bin'))
+  } catch {}
+  return [
+    ...nvmBins,
+    join(homedir(), '.local', 'bin'),
+    join(homedir(), '.bun', 'bin'),
+    join(homedir(), 'bin'),
+    '/usr/local/bin',
+  ]
+}
+
 /**
  * The `claude` binary to spawn. Resolved rather than hardcoded: the systemd
  * unit points at an nvm path that changes with every Node upgrade.
+ *
+ * A login shell is not enough to find it. nvm puts its PATH entry in
+ * ~/.bashrc, which returns early when the shell is not interactive, so
+ * `bash -lc` resolves nothing, the bare name is left to tmux, and the session
+ * exits on ENOENT the moment it starts — which surfaces as a session that died
+ * rather than one that never had a binary to run.
  */
 const CLAUDE_BIN: string = (() => {
   const fromEnv = process.env.CLAUDE_BIN
   if (fromEnv && existsSync(fromEnv)) return fromEnv
-  try {
-    const found = execFileSync('bash', ['-lc', 'command -v claude'], {
-      encoding: 'utf8',
-      timeout: 5_000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim()
-    if (found) return found
-  } catch {}
+  for (const flags of ['-lc', '-ic']) {
+    try {
+      const found = execFileSync('bash', [flags, 'command -v claude'], {
+        encoding: 'utf8',
+        timeout: 5_000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim()
+      if (found && existsSync(found)) return found
+    } catch {}
+  }
+  const installed = claudeBinDirs()
+    .map(d => join(d, 'claude'))
+    .find(existsSync)
+  if (installed) return installed
+  log('no claude binary found on PATH or in the usual install dirs; set CLAUDE_BIN')
   return 'claude'
 })()
 
@@ -789,14 +839,7 @@ async function spawnSession(
 
   try {
     // -e keeps the binding out of the command line, where it would show in ps.
-    startOnSessionServer([
-      '-L', SESSION_SOCKET,
-      'new-session', '-d',
-      '-s', tmux,
-      '-c', cwd,
-      '-e', `DISCORD_BIND_CHANNEL=${channel.id}`,
-      CLAUDE_BIN, '--channels', 'plugin:discord@claude-plugins-official',
-    ])
+    startOnSessionServer(sessionTmuxArgs(tmux, cwd, channel.id))
   } catch (e) {
     await rollback('Claude Code session failed to start')
     throw e
@@ -809,7 +852,8 @@ async function spawnSession(
     await rollback('Claude Code session exited immediately')
     log(`spawn died immediately: ${tmux} — channel ${channel.id} rolled back`)
     throw new Error(
-      `the session started and exited immediately — nothing in \`tmux -L ${SESSION_SOCKET} ls\` for ${tmux}`,
+      `the session started and exited immediately — nothing in \`tmux -L ${SESSION_SOCKET} ls\` ` +
+        `for ${tmux}. It was launched as ${CLAUDE_BIN}.`,
     )
   }
 
@@ -899,6 +943,9 @@ const ARCHIVE_GRACE_MS = 60_000
 
 function scheduleArchive(channelId: string): void {
   if (pendingArchives.has(channelId)) return
+  // A suspension also closes the socket, but that channel is still live —
+  // archiving it would retire a session the user is about to come back to.
+  if (loadAccess().spawned?.[channelId]?.suspendedSession) return
   const timer = setTimeout(() => {
     pendingArchives.delete(channelId)
     // Still gone after the grace period — now it has really ended.
@@ -916,22 +963,241 @@ function cancelArchive(channelId: string): void {
   pendingArchives.delete(channelId)
 }
 
+/**
+ * Retire a spawned channel and forget it. Forgetting is the point: `spawned`
+ * and `groups` were only ever appended to, so they had grown to 27 and 28
+ * entries against ten live sessions. A channel deleted in Discord drops its
+ * access grant too; one that still exists keeps it, so the transcript stays
+ * readable after the session behind it has gone.
+ */
 async function archiveChannel(channelId: string): Promise<void> {
   const access = loadAccess()
   if (!access.spawned?.[channelId]) return
+  let deleted = false
   try {
     const ch = await client.channels.fetch(channelId)
     if (!ch || ch.type !== ChannelType.GuildText) return
     const text = ch as TextChannel
-    if (text.name.startsWith('✓')) return
-    const category = await findOrCreateCategory(text.guild, access.archiveCategory ?? 'claude-archive')
-    await text.setParent(category.id, { lockPermissions: false })
-    await text.setName(`✓-${text.name}`.slice(0, 100))
-    await text.send('Session ended.')
+    if (!text.name.startsWith('✓')) {
+      const category = await findOrCreateCategory(
+        text.guild,
+        access.archiveCategory ?? 'claude-archive',
+      )
+      await text.setParent(category.id, { lockPermissions: false })
+      await text.setName(`✓-${text.name}`.slice(0, 100))
+      await text.send('Session ended.')
+    }
   } catch (e) {
-    log(`archive of ${channelId} failed: ${e}`)
+    // 10003 is Unknown Channel: it was deleted in Discord, so there is nothing
+    // to archive and no reason to keep granting access to it.
+    deleted = typeof e === 'object' && e !== null && (e as { code?: number }).code === 10003
+    if (!deleted) {
+      log(`archive of ${channelId} failed: ${e}`)
+      return // leave the entry so a later reconcile can retry
+    }
+  }
+  forgetSpawned(channelId, deleted)
+}
+
+/** Drop a retired channel's bookkeeping. */
+function forgetSpawned(channelId: string, alsoRevokeAccess: boolean): void {
+  const a = loadAccess()
+  if (a.spawned) delete a.spawned[channelId]
+  if (alsoRevokeAccess) delete a.groups[channelId]
+  saveAccess(a)
+}
+
+/**
+ * Per-session memory bounds. The tmux *server* already runs in a systemd scope,
+ * but every session started afterwards inherits that one cgroup — so a limit
+ * set there would cap the whole pool rather than one session. Wrapping the
+ * claude process itself gives each session a scope of its own, which is what
+ * makes a runaway die alone instead of the kernel shooting whichever session
+ * happens to be largest.
+ */
+const SESSION_MEMORY_HIGH = process.env.DISCORD_SESSION_MEMORY_HIGH ?? '1200M'
+const SESSION_MEMORY_MAX = process.env.DISCORD_SESSION_MEMORY_MAX ?? '1600M'
+
+/** tmux argv for a session, optionally resuming an existing Claude session. */
+function sessionTmuxArgs(
+  tmux: string,
+  cwd: string,
+  channelId: string,
+  resumeId?: string,
+): string[] {
+  return [
+    '-L', SESSION_SOCKET,
+    'new-session', '-d',
+    '-s', tmux,
+    '-c', cwd,
+    // -e keeps the binding out of the command line, where it would show in ps.
+    '-e', `DISCORD_BIND_CHANNEL=${channelId}`,
+    'systemd-run', '--user', '--scope', '--collect', '--quiet',
+    `--property=MemoryHigh=${SESSION_MEMORY_HIGH}`,
+    `--property=MemoryMax=${SESSION_MEMORY_MAX}`,
+    '--',
+    CLAUDE_BIN,
+    '--channels', 'plugin:discord@claude-plugins-official',
+    ...(resumeId ? ['--resume', resumeId] : []),
+  ]
+}
+
+// ── idle suspension ──────────────────────────────────────────────────────────
+
+/**
+ * Sessions are suspended rather than ended. Killing the process reclaims the
+ * ~400MB it holds, but the transcript outlives it, so the next message in the
+ * channel resumes the same conversation with `--resume`. That distinction is
+ * what makes a short timeout safe: this user habitually returns to a session
+ * the next morning, and a reaper that destroyed context would throw away the
+ * longest-running work on the machine.
+ */
+const DEFAULT_SESSION_IDLE_MS = 2 * 60 * 60 * 1000
+const IDLE_SWEEP_MS = 5 * 60 * 1000
+
+function sessionIdleMs(access: Access): number {
+  return access.sessionIdleMs ?? DEFAULT_SESSION_IDLE_MS
+}
+
+async function suspendSession(s: Session): Promise<void> {
+  const channelId = s.channelId
+  if (!channelId) return
+  const access = loadAccess()
+  const entry = access.spawned?.[channelId]
+  if (!entry) return // not ours to suspend
+
+  const tmux = tmuxNameFor(entry.name)
+  if (tmux === PROTECTED_TMUX) return
+  try {
+    execFileSync('tmux', ['-L', SESSION_SOCKET, 'kill-session', '-t', tmux], {
+      timeout: 10_000,
+      stdio: 'ignore',
+    })
+  } catch (e) {
+    log(`suspend of ${tmux} failed: ${String(e).slice(0, 200)}`)
+    return
+  }
+
+  // Recorded before the socket close lands, so the archive path can tell a
+  // suspension from a session that really ended.
+  const a = loadAccess()
+  if (a.spawned?.[channelId]) {
+    a.spawned[channelId].suspendedSession = s.meta.sessionId
+    a.spawned[channelId].suspendedAt = Date.now()
+    saveAccess(a)
+  }
+  log(`suspended ${shortId(s.meta.sessionId)} (${tmux}) after idle`)
+
+  try {
+    const ch = await client.channels.fetch(channelId)
+    if (ch && ch.type === ChannelType.GuildText) {
+      const hours = Math.round(sessionIdleMs(loadAccess()) / 3_600_000)
+      await (ch as TextChannel).send(
+        `Suspended after ${hours}h idle to free memory — its context is kept. ` +
+          `Send a message here and it picks up where it left off.`,
+      )
+    }
+  } catch {}
+}
+
+function sweepIdleSessions(): void {
+  const access = loadAccess()
+  const idleMs = sessionIdleMs(access)
+  if (idleMs <= 0) return
+  for (const s of registry.idleFor(idleMs)) {
+    // Only spawned sessions are suspendable; the systemd one and any
+    // hand-started session are left alone.
+    if (!s.channelId || !access.spawned?.[s.channelId]) continue
+    void suspendSession(s)
   }
 }
+
+/**
+ * Bring back a session suspended from this channel. Returns false when there is
+ * nothing to resume, so the caller can fall through to its usual handling.
+ */
+/**
+ * Channels whose session died without a clean exit — an OOM kill, a reboot —
+ * stay bound to a session that no longer exists, and nothing ever noticed
+ * because archival only ran on a deliberate stop. Reconciling at startup is
+ * what stops `spawned` growing without bound.
+ */
+async function reconcileSpawned(): Promise<void> {
+  const access = loadAccess()
+  const spawned = access.spawned ?? {}
+  const live = new Set(tmuxSessions())
+  let archived = 0
+  for (const [channelId, entry] of Object.entries(spawned)) {
+    if (entry.suspendedSession) continue // intentionally parked
+    if (live.has(tmuxNameFor(entry.name))) continue
+    if (registry.isBoundChannel(channelId)) continue
+    await archiveChannel(channelId)
+    archived++
+  }
+  if (archived > 0) {
+    const left = Object.keys(loadAccess().spawned ?? {}).length
+    log(`reconciled ${archived} channel(s) whose session was gone; ${left} tracked`)
+  }
+}
+
+async function resumeSuspended(channelId: string): Promise<boolean> {
+  const access = loadAccess()
+  const entry = access.spawned?.[channelId]
+  if (!entry?.suspendedSession) return false
+
+  const tmux = tmuxNameFor(entry.name)
+  if (tmuxSessions().includes(tmux)) return false // already running
+
+  const cwd = spawnRoot(access)
+  try {
+    startOnSessionServer(sessionTmuxArgs(tmux, cwd, channelId, entry.suspendedSession))
+  } catch (e) {
+    log(`resume of ${tmux} failed: ${String(e).slice(0, 200)}`)
+    return false
+  }
+  if (!(await sessionAppears(tmux))) {
+    log(`resume died immediately: ${tmux}`)
+    return false
+  }
+
+  const a = loadAccess()
+  if (a.spawned?.[channelId]) {
+    delete a.spawned[channelId].suspendedSession
+    delete a.spawned[channelId].suspendedAt
+    saveAccess(a)
+  }
+  cancelArchive(channelId)
+  log(`resumed ${shortId(entry.suspendedSession)} into ${tmux}`)
+  return true
+}
+
+
+/**
+ * Discord's typing indicator lapses after about ten seconds, and a turn here
+ * runs a median of two and a half minutes — so the single sendTyping() this
+ * replaces left every observed turn looking dead long before the answer
+ * arrived. Re-firing on an interval is the cheapest honest "still working".
+ */
+const TYPING_INTERVAL_MS = 8_000
+const typingTimers = new Map<string, ReturnType<typeof setInterval>>()
+
+function startTyping(sessionId: string, channel: unknown): void {
+  stopTyping(sessionId)
+  if (!channel || typeof channel !== 'object' || !('sendTyping' in channel)) return
+  const send = () => void (channel as TextChannel).sendTyping().catch(() => {})
+  send()
+  const timer = setInterval(send, TYPING_INTERVAL_MS)
+  timer.unref?.()
+  typingTimers.set(sessionId, timer)
+}
+
+function stopTyping(sessionId: string): void {
+  const timer = typingTimers.get(sessionId)
+  if (!timer) return
+  clearInterval(timer)
+  typingTimers.delete(sessionId)
+}
+
 
 // ── trace threads ────────────────────────────────────────────────────────────
 
@@ -1575,8 +1841,11 @@ async function onCommand(interaction: import('discord.js').ChatInputCommandInter
       target,
       'review',
       `Run the code-review skill at ${effort} effort on ${tgt ? `\`${tgt}\`` : 'the current diff'}. ` +
-        'Post the findings to Discord with the reply tool, most severe first, each with file:line ' +
-        'and a one-line failure scenario. Do not apply fixes unless asked.',
+        'The findings belong on the pull request, not only in chat: if the branch under ' +
+        'review has no open PR, push it and open one (draft is fine) first, then pass ' +
+        '--comment so the findings land as inline PR comments. ' +
+        'Then reply in Discord with the PR link and a one-line summary per finding, most ' +
+        'severe first, each with file:line. Do not apply fixes unless asked.',
       interaction.channelId,
       interaction.user.id,
       interaction.user.username,
@@ -1718,6 +1987,21 @@ async function handleInbound(msg: Message): Promise<void> {
   const target = registry.routeForMessage(chat_id, parentId)
 
   if (!target) {
+    // The channel may own a suspended session; bring it back and let the user
+    // resend rather than reporting nothing is connected.
+    if (await resumeSuspended(parentId ?? chat_id)) {
+      await msg
+        .reply('Resuming that session — it will pick up your message shortly.')
+        .then(m => noteSent(m.id))
+        .catch(() => {})
+      pendingTasks.set(parentId ?? chat_id, {
+        task: msg.content,
+        userId: msg.author.id,
+        username: msg.author.username,
+        at: Date.now(),
+      })
+      return
+    }
     await msg
       .reply('No Claude Code session is connected right now.')
       .then(m => noteSent(m.id))
@@ -1726,7 +2010,7 @@ async function handleInbound(msg: Message): Promise<void> {
   }
   registry.touch(target.meta.sessionId)
 
-  if ('sendTyping' in msg.channel) void msg.channel.sendTyping().catch(() => {})
+  startTyping(target.meta.sessionId, msg.channel)
 
   const access = result.access
   if (access.ackReaction) void msg.react(access.ackReaction).catch(() => {})
@@ -1769,6 +2053,10 @@ let idleTimer: ReturnType<typeof setTimeout> | null = null
 
 function armIdleExit(): void {
   if (idleTimer) clearTimeout(idleTimer)
+  // Under a supervisor the exit is pointless churn: systemd restarts the broker
+  // immediately, and in the gap the bot is simply absent from Discord. 0 keeps
+  // it resident.
+  if (IDLE_EXIT_MS <= 0) return
   if (registry.size > 0) return
   idleTimer = setTimeout(() => {
     if (registry.size === 0) {
@@ -1817,6 +2105,9 @@ function onConnection(sock: Socket): void {
       }
       case 'usage': {
         registry.setUsage(msg.sessionId, msg.usage)
+        // Transcript growth is the only signal that distinguishes a session
+        // working alone from one that has been abandoned.
+        registry.progress(msg.sessionId)
         scheduleTopicUpdate(true)
         break
       }
@@ -1832,7 +2123,10 @@ function onConnection(sock: Socket): void {
             reply = { t: 'result', id: msg.id, ok: true, text: await runTool(msg.tool, msg.args) }
             // The answer has been posted, so this turn's trace is complete.
             // A later step reopens a thread; that is the intended rhythm.
-            if (msg.tool === 'reply' && sessionId) await closeTraceThread(sessionId)
+            if (msg.tool === 'reply' && sessionId) {
+              stopTyping(sessionId)
+              await closeTraceThread(sessionId)
+            }
           } catch (e) {
             reply = {
               t: 'result',
@@ -1876,6 +2170,7 @@ function onConnection(sock: Socket): void {
     if (socks.get(sessionId) !== sock) return
     socks.delete(sessionId)
     const gone = registry.remove(sessionId)
+    stopTyping(sessionId)
     void closeTraceThread(sessionId)
     lastInboundMessage.delete(sessionId)
     lastTurn.delete(sessionId)
@@ -1888,7 +2183,73 @@ function onConnection(sock: Socket): void {
   })
 }
 
+/**
+ * Set only by claude-broker.service. INVOCATION_ID looks like the obvious
+ * marker and is not one: systemd sets it for every process in a unit and
+ * children inherit it, so a broker the shim started inside claude-cc.service
+ * reported itself supervised, refused to stand down, and fought the real one.
+ */
+const SUPERVISED = process.env.CLAUDE_BROKER_SUPERVISED === '1'
+const PID_PATH = join(STATE_DIR, 'broker.pid')
+const BROKER_UNIT = 'claude-broker.service'
+
+/**
+ * A shim starts a broker whenever it finds no socket. Once the job belongs to a
+ * unit that is the wrong instinct: every handover briefly frees the socket, the
+ * shims pile into that gap, and the supervised broker spends its life taking
+ * over from replacements it caused — 31 of them in one observed restart. An
+ * unsupervised broker therefore stands down whenever the unit is *enabled*.
+ * Enablement is the stable signal: is-active reads "activating" for the whole
+ * of a restart, which is exactly the window the shims race into.
+ */
+function supervisorOwnsThis(): boolean {
+  if (SUPERVISED) return false
+  try {
+    // A shim-spawned broker inherits Claude Code's environment, which carries
+    // neither XDG_RUNTIME_DIR nor the bus address — without them systemctl
+    // fails with "Failed to connect to bus", the check reads false, and the
+    // contender it was meant to remove starts anyway.
+    const out = execFileSync('systemctl', ['--user', 'is-enabled', BROKER_UNIT], {
+      timeout: 5_000,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: userBusEnv(),
+    })
+    return out.trim() === 'enabled'
+  } catch {
+    // Not active, no systemd, or no user manager — carry on as before.
+    return false
+  }
+}
+
+/**
+ * Ask the incumbent broker to stand down. It handles SIGTERM by releasing the
+ * socket, so the caller only has to wait before rebinding. Returns false when
+ * there is nothing to signal, in which case the caller should step aside as
+ * before rather than spin.
+ */
+function takeOverFrom(): boolean {
+  let pid = 0
+  try {
+    pid = Number(readFileSync(PID_PATH, 'utf8').trim())
+  } catch {
+    return false
+  }
+  if (!pid || pid === process.pid) return false
+  try {
+    process.kill(pid, 'SIGTERM')
+  } catch {
+    return false // already gone; the socket file is stale and will be reclaimed
+  }
+  log(`taking over from unsupervised broker (pid ${pid})`)
+  return true
+}
+
 function startSocket(): void {
+  if (supervisorOwnsThis()) {
+    log(`${BROKER_UNIT} is running — leaving the socket to it`)
+    process.exit(0)
+  }
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
   const server = createServer(onConnection)
   server.on('error', (err: NodeJS.ErrnoException) => {
@@ -1905,6 +2266,15 @@ function startSocket(): void {
       })
       probe.on('connect', () => {
         probe.destroy()
+        // A shim bootstraps a broker whenever it finds no socket, which races
+        // the supervised one on startup. Yielding here left systemd restarting
+        // every five seconds and exiting each time, while the unsupervised
+        // broker it deferred to stayed unsupervised. The managed instance takes
+        // over instead; an unmanaged one still steps aside.
+        if (SUPERVISED && takeOverFrom()) {
+          setTimeout(() => server.listen(SOCKET_PATH), 500)
+          return
+        }
         log('another broker is already listening — exiting')
         process.exit(0)
       })
@@ -1917,6 +2287,9 @@ function startSocket(): void {
   server.listen(SOCKET_PATH, () => {
     try {
       chmodSync(SOCKET_PATH, 0o600)
+    } catch {}
+    try {
+      writeFileSync(PID_PATH, String(process.pid), { mode: 0o600 })
     } catch {}
     log(`listening on ${SOCKET_PATH}`)
     armIdleExit()
@@ -1934,6 +2307,13 @@ function shutdown(): void {
   try {
     rmSync(SOCKET_PATH, { force: true })
   } catch {}
+  // Only clear the pidfile if it is still ours: a broker taking over has
+  // already written its own, and removing that would strand the next takeover.
+  try {
+    if (readFileSync(PID_PATH, 'utf8').trim() === String(process.pid)) {
+      rmSync(PID_PATH, { force: true })
+    }
+  } catch {}
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(client.destroy()).finally(() => process.exit(0))
 }
@@ -1946,6 +2326,8 @@ client.once('ready', c => {
   log(`gateway connected as ${c.user.tag}`)
   void registerCommands()
   scheduleTopicUpdate(true)
+  void reconcileSpawned()
+  setInterval(sweepIdleSessions, IDLE_SWEEP_MS).unref()
 })
 
 function login(): void {

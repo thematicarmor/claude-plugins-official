@@ -22,6 +22,14 @@ export type Session = {
   /** Channel this session owns outright, if it was spawned into one. */
   channelId: string | null
   lastActive: number
+  /**
+   * Last sign the session was *working*, as opposed to being spoken to.
+   * `lastActive` only moves when a human sends something, so a long
+   * autonomous run is indistinguishable from an abandoned session by that
+   * clock alone. The shim pushes `usage` whenever the transcript grows, which
+   * is what moves this one.
+   */
+  lastProgress: number
 }
 
 export function shortId(sessionId: string): string {
@@ -62,6 +70,7 @@ export class SessionRegistry {
       usage: existing?.usage ?? null,
       channelId: meta.bindChannel ?? existing?.channelId ?? null,
       lastActive: Date.now(),
+      lastProgress: existing?.lastProgress ?? Date.now(),
     }
     this.sessions.set(meta.sessionId, s)
     if (s.channelId) this.channelOwner.set(s.channelId, meta.sessionId)
@@ -91,6 +100,23 @@ export class SessionRegistry {
   touch(sessionId: string): void {
     const s = this.sessions.get(sessionId)
     if (s) s.lastActive = Date.now()
+  }
+
+  /** The session produced output — see `lastProgress`. */
+  progress(sessionId: string): void {
+    const s = this.sessions.get(sessionId)
+    if (s) s.lastProgress = Date.now()
+  }
+
+  /**
+   * Sessions quiet on *both* clocks for longer than `idleMs`. Requiring both
+   * is the point: a session mid-run keeps `lastProgress` fresh even though
+   * nobody has typed at it for hours.
+   */
+  idleFor(idleMs: number, now = Date.now()): Session[] {
+    return [...this.sessions.values()].filter(
+      s => now - s.lastActive > idleMs && now - s.lastProgress > idleMs,
+    )
   }
 
   setUsage(sessionId: string, usage: UsageSnapshot): void {
