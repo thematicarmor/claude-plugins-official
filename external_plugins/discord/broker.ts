@@ -589,21 +589,52 @@ async function runTool(tool: string, args: Record<string, unknown>): Promise<str
 
 const WORKSPACE_ROOT = join(homedir(), 'workspace')
 
+/** Directories a `claude` install lands in, newest node version first. */
+function claudeBinDirs(): string[] {
+  const nvm = join(homedir(), '.nvm', 'versions', 'node')
+  let nvmBins: string[] = []
+  try {
+    nvmBins = readdirSync(nvm)
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+      .map(v => join(nvm, v, 'bin'))
+  } catch {}
+  return [
+    ...nvmBins,
+    join(homedir(), '.local', 'bin'),
+    join(homedir(), '.bun', 'bin'),
+    join(homedir(), 'bin'),
+    '/usr/local/bin',
+  ]
+}
+
 /**
  * The `claude` binary to spawn. Resolved rather than hardcoded: the systemd
  * unit points at an nvm path that changes with every Node upgrade.
+ *
+ * A login shell is not enough to find it. nvm puts its PATH entry in
+ * ~/.bashrc, which returns early when the shell is not interactive, so
+ * `bash -lc` resolves nothing, the bare name is left to tmux, and the session
+ * exits on ENOENT the moment it starts — which surfaces as a session that died
+ * rather than one that never had a binary to run.
  */
 const CLAUDE_BIN: string = (() => {
   const fromEnv = process.env.CLAUDE_BIN
   if (fromEnv && existsSync(fromEnv)) return fromEnv
-  try {
-    const found = execFileSync('bash', ['-lc', 'command -v claude'], {
-      encoding: 'utf8',
-      timeout: 5_000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim()
-    if (found) return found
-  } catch {}
+  for (const flags of ['-lc', '-ic']) {
+    try {
+      const found = execFileSync('bash', [flags, 'command -v claude'], {
+        encoding: 'utf8',
+        timeout: 5_000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim()
+      if (found && existsSync(found)) return found
+    } catch {}
+  }
+  const installed = claudeBinDirs()
+    .map(d => join(d, 'claude'))
+    .find(existsSync)
+  if (installed) return installed
+  log('no claude binary found on PATH or in the usual install dirs; set CLAUDE_BIN')
   return 'claude'
 })()
 
@@ -821,7 +852,8 @@ async function spawnSession(
     await rollback('Claude Code session exited immediately')
     log(`spawn died immediately: ${tmux} — channel ${channel.id} rolled back`)
     throw new Error(
-      `the session started and exited immediately — nothing in \`tmux -L ${SESSION_SOCKET} ls\` for ${tmux}`,
+      `the session started and exited immediately — nothing in \`tmux -L ${SESSION_SOCKET} ls\` ` +
+        `for ${tmux}. It was launched as ${CLAUDE_BIN}.`,
     )
   }
 
